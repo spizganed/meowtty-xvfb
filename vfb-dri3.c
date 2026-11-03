@@ -5,14 +5,21 @@
  * linear buffer fd (PixmapFromBuffers). This file maps that fd and makes the memory the pixmap, so Present copies the
  * frame into the screen with the CPU. There is no render node: DRI3Open fails, and Mesa goes on without it.
  * The idea comes from the DRI3 of Termux:X11 (it accepts linear fds the same way); this is our own code.
+ *
+ * A compositor (KWin) needs the window pixmaps as fds (FdsFromPixmap) to use them as GPU textures. When the composite
+ * extension asks for a window pixmap, this file puts it in a dma-buf from /dev/dma_heap/system, which the Adreno Mesa
+ * can import. Other pixmaps stay in normal memory.
  */
 #ifdef HAVE_DIX_CONFIG_H
 #include <dix-config.h>
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <drm_fourcc.h>
@@ -25,13 +32,29 @@
 
 #define RAW_MMAPPABLE_FD 1274
 
+/* linux/dma-heap.h */
+struct vfb_dma_heap_allocation_data {
+    uint64_t len;
+    uint32_t fd;
+    uint32_t fd_flags;
+    uint64_t heap_flags;
+};
+#define VFB_DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct vfb_dma_heap_allocation_data)
+
+/* Window pixmaps smaller than this stay in normal memory. */
+#define DMABUF_MIN_PIXELS (32 * 32)
+
 typedef struct {
     void *map;
     size_t size;
+    int fd_plus_1; /* The fd of the memory plus 1: the private starts as zeros. */
+    CARD32 stride;
 } VfbDri3Pixmap;
 
 typedef struct {
     DestroyPixmapProcPtr DestroyPixmap;
+    CreatePixmapProcPtr CreatePixmap;
+    int heap; /* /dev/dma_heap/system, or -1 */
 } VfbDri3Screen;
 
 static DevPrivateKeyRec vfbDri3PixmapKey;
@@ -48,10 +71,14 @@ vfbDri3DestroyPixmap(PixmapPtr pixmap)
     VfbDri3Pixmap *p = PIXMAP_PRIV(pixmap);
     Bool ret;
 
-    /* The last reference: unmap the client buffer. */
+    /* The last reference: unmap the buffer. */
     if (pixmap->refcnt == 1 && p->map) {
         munmap(p->map, p->size);
         p->map = NULL;
+    }
+    if (pixmap->refcnt == 1 && p->fd_plus_1) {
+        close(p->fd_plus_1 - 1);
+        p->fd_plus_1 = 0;
     }
     screen->DestroyPixmap = s->DestroyPixmap;
     ret = screen->DestroyPixmap(pixmap);
@@ -97,19 +124,95 @@ vfbDri3PixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *fds, CARD16 wid
     p = PIXMAP_PRIV(pixmap);
     p->map = map;
     p->size = size;
+    /* Keep the fd: a compositor can ask for it again (FdsFromPixmap). Only for a buffer at offset 0. */
+    if (offsets[0] == 0) {
+        int fd = fcntl(fds[0], F_DUPFD_CLOEXEC, 3);
+        if (fd >= 0) {
+            p->fd_plus_1 = fd + 1;
+            p->stride = strides[0];
+        }
+    }
     return pixmap;
 }
 
+/* A window pixmap of the composite extension in a dma-buf; other pixmaps as usual. */
+static PixmapPtr
+vfbDri3CreatePixmap(ScreenPtr screen, int width, int height, int depth, unsigned usage)
+{
+    VfbDri3Screen *s = SCREEN_PRIV(screen);
+    struct vfb_dma_heap_allocation_data alloc = { 0 };
+    PixmapPtr pixmap;
+    VfbDri3Pixmap *p;
+    CARD32 stride;
+    size_t size;
+    void *map;
+
+    if (usage != CREATE_PIXMAP_USAGE_BACKING_PIXMAP || s->heap < 0 || (depth != 24 && depth != 32) ||
+        width <= 0 || height <= 0 || width > 16384 || height > 16384 || width * height < DMABUF_MIN_PIXELS)
+        goto plain;
+    /* A 256-byte row and whole pages: the GPU import needs aligned buffers. */
+    stride = ((CARD32) width * 4 + 255) & ~255u;
+    size = ((size_t) stride * height + 4095) & ~(size_t) 4095;
+    alloc.len = size;
+    alloc.fd_flags = O_RDWR | O_CLOEXEC;
+    if (ioctl(s->heap, VFB_DMA_HEAP_IOCTL_ALLOC, &alloc) != 0)
+        goto plain;
+    map = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, (int) alloc.fd, 0);
+    if (map == MAP_FAILED) {
+        close((int) alloc.fd);
+        goto plain;
+    }
+    screen->CreatePixmap = s->CreatePixmap;
+    pixmap = screen->CreatePixmap(screen, 0, 0, depth, usage);
+    screen->CreatePixmap = vfbDri3CreatePixmap;
+    if (!pixmap || !screen->ModifyPixmapHeader(pixmap, width, height, depth, 32, stride, map)) {
+        if (pixmap)
+            screen->DestroyPixmap(pixmap);
+        munmap(map, size);
+        close((int) alloc.fd);
+        goto plain;
+    }
+    p = PIXMAP_PRIV(pixmap);
+    p->map = map;
+    p->size = size;
+    p->fd_plus_1 = (int) alloc.fd + 1;
+    p->stride = stride;
+    return pixmap;
+
+plain:
+    screen->CreatePixmap = s->CreatePixmap;
+    pixmap = screen->CreatePixmap(screen, width, height, depth, usage);
+    screen->CreatePixmap = vfbDri3CreatePixmap;
+    return pixmap;
+}
+
+/* Only pixmaps in a dma-buf or a client buffer have an fd. */
 static int
 vfbDri3FdFromPixmap(ScreenPtr screen, PixmapPtr pixmap, CARD16 *stride, CARD32 *size)
 {
-    return -1; /* Pixmaps of the server have no fd. */
+    VfbDri3Pixmap *p = PIXMAP_PRIV(pixmap);
+
+    if (!p->fd_plus_1 || p->stride > 65535)
+        return -1;
+    *stride = (CARD16) p->stride;
+    *size = (CARD32) p->size;
+    return fcntl(p->fd_plus_1 - 1, F_DUPFD_CLOEXEC, 3);
 }
 
 static int
 vfbDri3FdsFromPixmap(ScreenPtr screen, PixmapPtr pixmap, int *fds, uint32_t *strides, uint32_t *offsets, uint64_t *modifier)
 {
-    return 0;
+    VfbDri3Pixmap *p = PIXMAP_PRIV(pixmap);
+
+    if (!p->fd_plus_1)
+        return 0;
+    fds[0] = fcntl(p->fd_plus_1 - 1, F_DUPFD_CLOEXEC, 3);
+    if (fds[0] < 0)
+        return 0;
+    strides[0] = p->stride;
+    offsets[0] = 0;
+    *modifier = DRM_FORMAT_MOD_LINEAR;
+    return 1;
 }
 
 /* The DRI3 core frees the lists that these return: each call gives a new copy. */
@@ -174,5 +277,10 @@ vfbDri3Init(ScreenPtr screen)
     s = SCREEN_PRIV(screen);
     s->DestroyPixmap = screen->DestroyPixmap;
     screen->DestroyPixmap = vfbDri3DestroyPixmap;
+    s->CreatePixmap = screen->CreatePixmap;
+    screen->CreatePixmap = vfbDri3CreatePixmap;
+    s->heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+    if (s->heap < 0)
+        ErrorF("vfb-dri3: no /dev/dma_heap/system (%s): window pixmaps have no fd\n", strerror(errno));
     return dri3_screen_init(screen, &vfbDri3Info);
 }
