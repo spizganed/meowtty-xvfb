@@ -8,7 +8,8 @@
  *
  * A compositor (KWin) needs the window pixmaps as fds (FdsFromPixmap) to use them as GPU textures. When the composite
  * extension asks for a window pixmap, this file puts it in a dma-buf from /dev/dma_heap/system, which the Adreno Mesa
- * can import. Other pixmaps stay in normal memory.
+ * can import. Other pixmaps stay in normal memory. The CPU caches that memory: after a drawing, the block handler
+ * flushes the cache (DMA_BUF_IOCTL_SYNC) before the clients get their events, so the GPU reads the new pixels.
  */
 #ifdef HAVE_DIX_CONFIG_H
 #include <dix-config.h>
@@ -28,6 +29,7 @@
 #include "pixmapstr.h"
 #include "privates.h"
 #include "dri3.h"
+#include "damage.h"
 #include "vfb-dri3.h"
 
 #define RAW_MMAPPABLE_FD 1274
@@ -41,6 +43,15 @@ struct vfb_dma_heap_allocation_data {
 };
 #define VFB_DMA_HEAP_IOCTL_ALLOC _IOWR('H', 0x0, struct vfb_dma_heap_allocation_data)
 
+/* linux/dma-buf.h */
+struct vfb_dma_buf_sync {
+    uint64_t flags;
+};
+#define VFB_DMA_BUF_SYNC_RW 3
+#define VFB_DMA_BUF_SYNC_START 0
+#define VFB_DMA_BUF_SYNC_END 4
+#define VFB_DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct vfb_dma_buf_sync)
+
 /* Window pixmaps smaller than this stay in normal memory. */
 #define DMABUF_MIN_PIXELS (32 * 32)
 
@@ -49,7 +60,13 @@ typedef struct {
     size_t size;
     int fd_plus_1; /* The fd of the memory plus 1: the private starts as zeros. */
     CARD32 stride;
+    DamagePtr damage; /* Only for the dma-bufs of the server: their cache needs a flush. */
+    Bool dirty;
 } VfbDri3Pixmap;
+
+/* The dma-buf pixmaps with a drawing since the last flush. */
+static VfbDri3Pixmap **dirtyList;
+static int dirtyCount, dirtySize;
 
 typedef struct {
     DestroyPixmapProcPtr DestroyPixmap;
@@ -62,6 +79,69 @@ static DevPrivateKeyRec vfbDri3ScreenKey;
 
 #define PIXMAP_PRIV(p) ((VfbDri3Pixmap *) dixLookupPrivate(&(p)->devPrivates, &vfbDri3PixmapKey))
 #define SCREEN_PRIV(s) ((VfbDri3Screen *) dixLookupPrivate(&(s)->devPrivates, &vfbDri3ScreenKey))
+
+static void
+vfbDri3Sync(int fd, uint64_t flags)
+{
+    struct vfb_dma_buf_sync sync = { flags | VFB_DMA_BUF_SYNC_RW };
+    while (ioctl(fd, VFB_DMA_BUF_IOCTL_SYNC, &sync) != 0 && (errno == EINTR || errno == EAGAIN))
+        ;
+}
+
+/* The first drawing after a flush: the pixmap goes on the list. */
+static void
+vfbDri3Damage(DamagePtr damage, RegionPtr region, void *closure)
+{
+    VfbDri3Pixmap *p = closure;
+    VfbDri3Pixmap **list;
+
+    if (p->dirty)
+        return;
+    if (dirtyCount == dirtySize) {
+        list = reallocarray(dirtyList, dirtySize ? dirtySize * 2 : 64, sizeof(*list));
+        if (!list)
+            return;
+        dirtyList = list;
+        dirtySize = dirtySize ? dirtySize * 2 : 64;
+    }
+    p->dirty = TRUE;
+    dirtyList[dirtyCount++] = p;
+}
+
+/* The damage layer can destroy the damage first, when it frees the pixmap. */
+static void
+vfbDri3DamageGone(DamagePtr damage, void *closure)
+{
+    VfbDri3Pixmap *p = closure;
+    int i;
+
+    for (i = 0; i < dirtyCount; i++)
+        if (dirtyList[i] == p)
+            dirtyList[i--] = dirtyList[--dirtyCount];
+    p->damage = NULL;
+    p->dirty = FALSE;
+}
+
+/* Before the server waits (and sends the events): flush the cache of each pixmap with a drawing. */
+static void
+vfbDri3BlockHandler(void *data, void *timeout)
+{
+    int i;
+
+    for (i = 0; i < dirtyCount; i++) {
+        VfbDri3Pixmap *p = dirtyList[i];
+        vfbDri3Sync(p->fd_plus_1 - 1, VFB_DMA_BUF_SYNC_END);
+        vfbDri3Sync(p->fd_plus_1 - 1, VFB_DMA_BUF_SYNC_START);
+        p->dirty = FALSE;
+        DamageEmpty(p->damage);
+    }
+    dirtyCount = 0;
+}
+
+static void
+vfbDri3WakeupHandler(void *data, int result)
+{
+}
 
 static Bool
 vfbDri3DestroyPixmap(PixmapPtr pixmap)
@@ -76,6 +156,8 @@ vfbDri3DestroyPixmap(PixmapPtr pixmap)
         munmap(p->map, p->size);
         p->map = NULL;
     }
+    if (pixmap->refcnt == 1 && p->damage)
+        DamageDestroy(p->damage); /* It unregisters, and vfbDri3DamageGone clears the fields. */
     if (pixmap->refcnt == 1 && p->fd_plus_1) {
         close(p->fd_plus_1 - 1);
         p->fd_plus_1 = 0;
@@ -177,6 +259,11 @@ vfbDri3CreatePixmap(ScreenPtr screen, int width, int height, int depth, unsigned
     p->size = size;
     p->fd_plus_1 = (int) alloc.fd + 1;
     p->stride = stride;
+    /* The CPU holds the buffer until the next flush. */
+    vfbDri3Sync((int) alloc.fd, VFB_DMA_BUF_SYNC_START);
+    p->damage = DamageCreate(vfbDri3Damage, vfbDri3DamageGone, DamageReportNonEmpty, TRUE, screen, p);
+    if (p->damage)
+        DamageRegister(&pixmap->drawable, p->damage);
     return pixmap;
 
 plain:
@@ -280,6 +367,10 @@ vfbDri3Init(ScreenPtr screen)
     s->CreatePixmap = screen->CreatePixmap;
     screen->CreatePixmap = vfbDri3CreatePixmap;
     s->heap = open("/dev/dma_heap/system", O_RDONLY | O_CLOEXEC);
+    if (s->heap >= 0 && !RegisterBlockAndWakeupHandlers(vfbDri3BlockHandler, vfbDri3WakeupHandler, NULL)) {
+        close(s->heap);
+        s->heap = -1;
+    }
     if (s->heap < 0)
         ErrorF("vfb-dri3: no /dev/dma_heap/system (%s): window pixmaps have no fd\n", strerror(errno));
     return dri3_screen_init(screen, &vfbDri3Info);
