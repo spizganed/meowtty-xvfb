@@ -134,5 +134,6 @@ meson setup build --cross-file "$W/cross.txt" --prefix="$P" --buildtype=release 
   -Dsha1=libnettle -Dxselinux=false -Dlinux_apm=false -Dlinux_acpi=false -Dvgahw=false -Dlibunwind=false \
   -Dxkb_dir=/usr/share/X11/xkb -Dxkb_bin_dir=/usr/bin -Dxkb_output_dir=/tmp -Ddefault_font_path=built-ins
 ninja -C build hw/vfb/Xvfb
+mkdir -p "$(dirname "$OUT")"
 "$STRIP" -o "$OUT" build/hw/vfb/Xvfb
 echo "Built $OUT"
