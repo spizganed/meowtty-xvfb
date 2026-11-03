@@ -9,6 +9,9 @@ xorg-server tree. Argument: the prefix that holds the xtrans source (include/X11
 - Popen and System call setuid and setgid only when the ids differ: Android kills an app for them (seccomp).
 - MEOWTTY_XBUF: the abstract socket of the app. The screen is then the AHardwareBuffer that the app sends there
   (vfb-android.c); the app shows it with no copy.
+- GLX with direct rendering only (vfb-glx.c in place of the swrast provider): the clients render with their own Mesa.
+- MIT-SHM with fds only: the server makes its segments with memfd_create, and a SysV attach fails with BadAccess
+  (Android kills an app for shmat). The clients under proot have no SysV shared memory that the server can see.
 - The socket and the lock paths have no leading slash: "tmp/.X11-unix/X2". The app starts the server in the root folder
   of the Linux system, so the socket is in the /tmp of that system, where the clients under proot look for it.
 """
@@ -84,6 +87,29 @@ patch("hw/vfb/InitOutput.c",
       "        if (shared)\n"
       "            pbits = pvfb->pfbMemory = shared;\n"
       "    }\n")
+
+# GLX: our provider (vfb-glx.c) in place of the swrast provider and the DRI helpers, which load a GL driver.
+shutil.copy(os.path.join(here, "vfb-glx.c"), "glx/")
+patch("glx/meson.build", "    'glxdriswrast.c',\n    'glxdricommon.c',\n", "    'vfb-glx.c',\n")
+patch("glx/glxext.c", "static __GLXprovider *__glXProviderStack = &__glXDRISWRastProvider;",
+      "extern __GLXprovider __glXMeowProvider;\nstatic __GLXprovider *__glXProviderStack = &__glXMeowProvider;")
+
+# MIT-SHM: no SysV shared memory in an app process (seccomp). The fd paths (AttachFd, CreateSegment) work.
+patch("Xext/shm.c",
+      "        shmdesc->addr = shmat(stuff->shmid, 0,",
+      "#ifdef __ANDROID__\n"
+      "        /* MeowTTY: Android kills an app for shmat. The client must send an fd (ShmAttachFd). */\n"
+      "        free(shmdesc);\n"
+      "        return BadAccess;\n"
+      "#endif\n"
+      "        shmdesc->addr = shmat(stuff->shmid, 0,")
+# dix-config.h undefines HAVE_MEMFD_CREATE (bionic before API 30 has no wrapper), and Android has no /tmp: call the
+# kernel directly.
+patch("Xext/shm.c",
+      "#ifdef HAVE_MEMFD_CREATE\n    fd = memfd_create(\"xorg\", MFD_CLOEXEC|MFD_ALLOW_SEALING);",
+      "#if defined(HAVE_MEMFD_CREATE) || defined(__ANDROID__)\n"
+      "    fd = (int) syscall(__NR_memfd_create, \"xorg\", MFD_CLOEXEC|MFD_ALLOW_SEALING);")
+patch("Xext/shm.c", "#include <sys/types.h>\n", "#include <sys/types.h>\n#include <sys/syscall.h>\n#include <linux/memfd.h>\n")
 
 prefix = sys.argv[1]
 sock = f"{prefix}/include/X11/Xtrans/Xtranssock.c"

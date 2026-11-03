@@ -123,16 +123,40 @@ fetch nettle https://ftp.gnu.org/gnu/nettle/nettle-3.10.1.tar.gz b0fcdd7fc0cdea6
 a --disable-public-key --disable-documentation --disable-openssl --disable-mini-gmp
 fi
 
+# GLX needs the GL headers, and pkg-config entries for "gl" and "dri". The server has no GL: vfb-glx.c gives direct
+# rendering only, and libGL.a below holds empty stubs for the indirect code, which never runs.
+mkdir -p "$P/include/GL" "$P/include/KHR"
+M=https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-25.0.0/include
+for h in GL/gl.h:f09313b53505928802f07d1b7fa9d40e7abe7728db389ec8fab348778073e4f1 \
+  GL/glext.h:9fa7eb34b3a2c05fe6dfbe444260eed2aaa1d099dd13df2673316a26759e7078 \
+  KHR/khrplatform.h:7b1e01aaa7ad8f6fc34b5c7bdf79ebf5189bb09e2c4d2e79fc5d350623d11e83; do
+  f=$P/include/${h%%:*}
+  [ -e "$f" ] || curl -sSfL -o "$f" "$M/${h%%:*}"
+  echo "${h#*:}  $f" | sha256sum -c --quiet
+done
+printf 'Name: gl\nDescription: GL headers only\nVersion: 25.0.0\nCflags: -I%s/include\nLibs: -L%s/lib -lGL\n' "$P" "$P" \
+  > "$P/lib/pkgconfig/gl.pc"
+printf 'dridriverdir=/nonexistent\nName: dri\nDescription: no DRI drivers\nVersion: 25.0.0\nCflags: -I%s/include\n' "$P" \
+  > "$P/lib/pkgconfig/dri.pc"
+
 fetch xorg-server $X/xserver/xorg-server-21.1.22.tar.xz 1a242c8917c49ba29ccc1f6021613d8a2b9805dd0d271a66ae9d09f4b0bb06b3
 python3 "$HERE/patch-dri3.py"
 python3 "$HERE/patch-android.py" "$P"
 # The paths below are the ones in the Linux system; the app gives the real ones (-xkbdir, -fp, MEOWTTY_XKBCOMP).
 meson setup build --cross-file "$W/cross.txt" --prefix="$P" --buildtype=release \
   -Dxorg=false -Dxephyr=false -Dxnest=false -Dxwin=false -Dxquartz=false -Dxvfb=true \
-  -Dglx=false -Dglamor=false -Ddri1=false -Ddri2=false -Ddri3=true -Dudev=false -Dudev_kms=false -Dsystemd_logind=false \
-  -Dhal=false -Ddocs=false -Ddevel-docs=false -Dsecure-rpc=false -Dmitshm=false -Dxdmcp=false -Dxdm-auth-1=false \
+  -Dglx=true -Dglamor=false -Ddri1=false -Ddri2=false -Ddri3=true -Dudev=false -Dudev_kms=false -Dsystemd_logind=false \
+  -Dhal=false -Ddocs=false -Ddevel-docs=false -Dsecure-rpc=false -Dmitshm=true -Dxdmcp=false -Dxdm-auth-1=false \
   -Dsha1=libnettle -Dxselinux=false -Dlinux_apm=false -Dlinux_acpi=false -Dvgahw=false -Dlibunwind=false \
   -Dxkb_dir=/usr/share/X11/xkb -Dxkb_bin_dir=/usr/bin -Dxkb_output_dir=/tmp -Ddefault_font_path=built-ins
+# Empty stubs for the GL calls of the indirect GLX code (it runs only with +iglx, and then has no context).
+ninja -C build glx/liblibxserver_glx.a glx/liblibglxvnd.a
+"$LLVM/llvm-nm" -u build/glx/*.a | awk '{print $NF}' | grep '^gl[A-Z]' | sort -u > gl-undefined.txt
+"$LLVM/llvm-nm" --defined-only build/glx/*.a | awk '{print $NF}' | grep '^gl[A-Z]' | sort -u > gl-defined.txt
+comm -23 gl-undefined.txt gl-defined.txt | sed 's/.*/void &(void) {}/' > glstub.c
+echo "GL stubs: $(wc -l < glstub.c)"
+"$CC" -c -O2 -fPIC -o glstub.o glstub.c
+rm -f "$P/lib/libGL.a" && "$AR" rc "$P/lib/libGL.a" glstub.o
 ninja -C build hw/vfb/Xvfb
 mkdir -p "$(dirname "$OUT")"
 "$STRIP" -o "$OUT" build/hw/vfb/Xvfb
