@@ -7,6 +7,8 @@ xorg-server tree. Argument: the prefix that holds the xtrans source (include/X11
   the built-in folder.
 - MEOWTTY_XKM_DIR: the folder for the compiled keymap. It must be absolute: xkbcomp -R changes the working folder.
 - Popen and System call setuid and setgid only when the ids differ: Android kills an app for them (seccomp).
+- MEOWTTY_XBUF: the abstract socket of the app. The screen is then the AHardwareBuffer that the app sends there
+  (vfb-android.c); the app shows it with no copy.
 - The socket and the lock paths have no leading slash: "tmp/.X11-unix/X2". The app starts the server in the root folder
   of the Linux system, so the socket is in the /tmp of that system, where the clients under proot look for it.
 """
@@ -54,6 +56,34 @@ if "getegid() != getgid() &&" not in s:
     s = s.replace("if (setgid(getgid()) == -1)", "if (getegid() != getgid() && setgid(getgid()) == -1)")
     s = s.replace("if (setuid(getuid()) == -1)", "if (geteuid() != getuid() && setuid(getuid()) == -1)")
     open("os/utils.c", "w").write(s)
+
+# The screen in the AHardwareBuffer of the app (vfb-android.c), when MEOWTTY_XBUF names its socket. The usual memory
+# still holds the XWD header and the colour map; malloc does not touch the screen part of it.
+import os, shutil
+here = os.path.dirname(os.path.abspath(__file__))
+for f in ("vfb-android.c", "vfb-android.h"):
+    shutil.copy(os.path.join(here, f), "hw/vfb/")
+patch("hw/vfb/meson.build", "    'vfb-dri3.c',\n", "    'vfb-dri3.c',\n    'vfb-android.c',\n")
+patch("hw/vfb/meson.build", "    install: true,\n)\n", "    link_args: ['-lnativewindow'],\n    install: true,\n)\n")
+patch("hw/vfb/InitOutput.c", '#include "vfb-dri3.h"\n#endif\n', '#include "vfb-dri3.h"\n#endif\n#include "vfb-android.h"\n')
+patch("hw/vfb/InitOutput.c",
+      "    pbits = vfbAllocateFramebufferMemory(pvfb);\n    if (!pbits)\n        return FALSE;\n",
+      "    {\n"
+      "        /* MeowTTY: the screen in the buffer of the app. */\n"
+      "        int stride = 0;\n"
+      "        char *shared = getenv(\"MEOWTTY_XBUF\") ? vfbAndroidBuffer(pvfb->width, pvfb->height, &stride) : NULL;\n"
+      "        if (getenv(\"MEOWTTY_XBUF\") && !shared)\n"
+      "            FatalError(\"vfb: no buffer from the app (MEOWTTY_XBUF)\\n\");\n"
+      "        if (shared) {\n"
+      "            pvfb->paddedBytesWidth = stride;\n"
+      "            pvfb->paddedWidth = stride / (pvfb->bitsPerPixel / 8);\n"
+      "        }\n"
+      "        pbits = vfbAllocateFramebufferMemory(pvfb);\n"
+      "        if (!pbits)\n"
+      "            return FALSE;\n"
+      "        if (shared)\n"
+      "            pbits = pvfb->pfbMemory = shared;\n"
+      "    }\n")
 
 prefix = sys.argv[1]
 sock = f"{prefix}/include/X11/Xtrans/Xtranssock.c"

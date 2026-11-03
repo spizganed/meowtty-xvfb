@@ -40,7 +40,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Xvfb-meowtty-android-arm64
-          path: out/Xvfb-meowtty-android-arm64
+          path: |
+            out/Xvfb-meowtty-android-arm64
+            out/libmeowtty-xbuf-android-arm64.so
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: [build, android]
@@ -54,6 +56,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cd out && sha256sum Xvfb-meowtty-* > SHA256SUMS
+          cd out && sha256sum Xvfb-meowtty-* libmeowtty-xbuf-* > SHA256SUMS
           gh release create "${{ github.ref_name }}" -R "${{ github.repository }}" --title "${{ github.ref_name }}" \
-            --notes "Xvfb with the small DRI3 of MeowTTY, built from the xorg-server source of each distro, and for Android." Xvfb-meowtty-* SHA256SUMS
+            --notes "Xvfb with the small DRI3 of MeowTTY, built from the xorg-server source of each distro, and for Android." Xvfb-meowtty-* libmeowtty-xbuf-* SHA256SUMS

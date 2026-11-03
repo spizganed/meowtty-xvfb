@@ -137,3 +137,8 @@ ninja -C build hw/vfb/Xvfb
 mkdir -p "$(dirname "$OUT")"
 "$STRIP" -o "$OUT" build/hw/vfb/Xvfb
 echo "Built $OUT"
+# The JNI library of the app that sends the screen buffer to the server (xbuf-jni.c).
+JNI=${JNI_OUT:-$(dirname "$OUT")/libmeowtty-xbuf-android-arm64.so}
+"$CC" -shared -fPIC -O2 -o "$JNI" "$HERE/xbuf-jni.c" -landroid -lnativewindow
+"$STRIP" "$JNI"
+echo "Built $JNI"

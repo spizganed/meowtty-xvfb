@@ -20,6 +20,8 @@ The workflow builds it for Ubuntu 26.04 and Debian 13 (arm64) at each `v*` tag a
 - `MEOWTTY_XKBCOMP`: the command that compiles the keymap, for example a script that runs `xkbcomp` in the Linux system. `MEOWTTY_XKM_DIR`: an absolute folder for its output.
 - The socket path has no leading slash (`tmp/.X11-unix/X2`): start the server in the root folder of the Linux system.
 
+- `MEOWTTY_XBUF`: the abstract unix socket of the app. The server takes an AHardwareBuffer there (`vfb-android.c`) and uses its memory as the screen; the app shows the same buffer with no copy. `xbuf-jni.c` is the JNI library of the app that sends the buffer (`libmeowtty-xbuf-android-arm64.so`).
+
 The NDK compiler runs on x86_64 only. On an arm64 host, the script builds with the system clang and the sysroot and runtime of the NDK. The workflow builds it with the NDK of the runner.
 
 Measured on the phone (Adreno 810), x11perf from a client under proot: PutImage 500x500 1270/s (Xvfb under proot: 605/s), copy 500x500 window to window 12000/s (8700/s). glmark2-es2 through the DRI3: 331.
