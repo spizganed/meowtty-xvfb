@@ -6,6 +6,7 @@ xorg-server tree. Argument: the prefix that holds the xtrans source (include/X11
 - MEOWTTY_XKBCOMP: the command that compiles the keymap, for example "sh /path/xkbcomp.sh". Without it: xkbcomp from
   the built-in folder.
 - MEOWTTY_XKM_DIR: the folder for the compiled keymap. It must be absolute: xkbcomp -R changes the working folder.
+- Popen and System call setuid and setgid only when the ids differ: Android kills an app for them (seccomp).
 - The socket and the lock paths have no leading slash: "tmp/.X11-unix/X2". The app starts the server in the root folder
   of the Linux system, so the socket is in the /tmp of that system, where the clients under proot look for it.
 """
@@ -45,6 +46,14 @@ patch("xkb/ddxLoad.c",
 patch("xkb/ddxLoad.c",
       "        buf = NULL;\n\n    free(xkbbasedirflag);",
       "        buf = NULL;\n\n    free(xkbcompcmd);\n    free(xkbbasedirflag);")
+
+# Android kills an app for setuid and setgid (seccomp, SIGSYS), even to its own ids. Popen and System call them
+# before they start a command such as xkbcomp: only call them when the ids differ (a setuid server).
+s = open("os/utils.c").read()
+if "getegid() != getgid() &&" not in s:
+    s = s.replace("if (setgid(getgid()) == -1)", "if (getegid() != getgid() && setgid(getgid()) == -1)")
+    s = s.replace("if (setuid(getuid()) == -1)", "if (geteuid() != getuid() && setuid(getuid()) == -1)")
+    open("os/utils.c", "w").write(s)
 
 prefix = sys.argv[1]
 sock = f"{prefix}/include/X11/Xtrans/Xtranssock.c"
