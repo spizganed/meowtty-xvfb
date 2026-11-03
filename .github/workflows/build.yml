@@ -1,4 +1,5 @@
-# Builds Xvfb with the small DRI3 for each distro of MeowTTY (arm64), and puts the binaries on a release.
+# Builds Xvfb with the small DRI3 for each distro of MeowTTY (arm64) and for Android (arm64), and puts the binaries on
+# a release.
 # Run it from a tag (v*) or by hand. Each binary links the libraries of its distro: use the one for your system.
 name: Build
 on:
@@ -27,9 +28,22 @@ jobs:
         with:
           name: Xvfb-meowtty-${{ matrix.distro }}-arm64
           path: out/Xvfb-meowtty-${{ matrix.distro }}-arm64
+  android:
+    # The NDK compiler runs on x86_64 only. The runner has an NDK (ANDROID_NDK_LATEST_HOME).
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends meson ninja-build pkg-config autoconf automake libtool xz-utils
+      - name: Build for Android
+        run: OUT=$PWD/out/Xvfb-meowtty-android-arm64 sh build-android.sh "$RUNNER_TEMP/xandroid"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Xvfb-meowtty-android-arm64
+          path: out/Xvfb-meowtty-android-arm64
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, android]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
@@ -42,4 +56,4 @@ jobs:
         run: |
           cd out && sha256sum Xvfb-meowtty-* > SHA256SUMS
           gh release create "${{ github.ref_name }}" -R "${{ github.repository }}" --title "${{ github.ref_name }}" \
-            --notes "Xvfb with the small DRI3 of MeowTTY, built from the xorg-server source of each distro." Xvfb-meowtty-* SHA256SUMS
+            --notes "Xvfb with the small DRI3 of MeowTTY, built from the xorg-server source of each distro, and for Android." Xvfb-meowtty-* SHA256SUMS

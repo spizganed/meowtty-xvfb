@@ -19,22 +19,7 @@ apt-get -y install --no-install-recommends meson ninja-build python3 dpkg-dev
 mkdir -p "$W" && cd "$W"
 [ -n "$(ls -d xorg-server-*/ 2>/dev/null)" ] || apt-get source xorg-server
 cd "$(ls -d xorg-server-*/ | tail -1)"
-cp "$HERE/vfb-dri3.c" "$HERE/vfb-dri3.h" hw/vfb/
-# Add the file to the Xvfb build, and call vfbDri3Init at the end of the screen setup.
-python3 - <<'EOF'
-p = "hw/vfb/meson.build"; s = open(p).read()
-if "vfb-dri3.c" not in s:
-    s = s.replace("    'InitOutput.c',\n", "    'InitOutput.c',\n    'vfb-dri3.c',\n", 1)
-    s = s.replace("    dependencies: common_dep,", "    dependencies: [common_dep, libdrm_dep],", 1)
-    open(p, "w").write(s)
-p = "hw/vfb/InitOutput.c"; s = open(p).read()
-if "vfbDri3Init" not in s:
-    s = s.replace('#include "micmap.h"', '#include "micmap.h"\n#ifdef DRI3\n#include "vfb-dri3.h"\n#endif', 1)
-    i = s.index("/* end vfbScreenInit */")
-    j = s.rindex("    return ret;", 0, i)
-    s = s[:j] + '#ifdef DRI3\n    if (ret && !vfbDri3Init(pScreen))\n        ErrorF("vfb: DRI3 init failed\\n");\n#endif\n' + s[j:]
-    open(p, "w").write(s)
-EOF
+python3 "$HERE/patch-dri3.py"
 [ -d build ] || meson setup build -Dxorg=false -Dxephyr=false -Dxnest=false -Dxwin=false -Dxvfb=true -Ddri3=true \
   -Dglamor=false -Dudev=false -Dudev_kms=false -Dsystemd_logind=false -Dhal=false -Ddocs=false -Ddevel-docs=false -Dsecure-rpc=false \
   -Dxkb_dir=/usr/share/X11/xkb -Dxkb_bin_dir=/usr/bin -Dxkb_output_dir=/var/lib/xkb
