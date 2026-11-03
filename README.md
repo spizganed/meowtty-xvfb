@@ -20,6 +20,10 @@ The workflow builds it for Ubuntu 26.04 and Debian 13 (arm64) at each `v*` tag a
 - `MEOWTTY_XKBCOMP`: the command that compiles the keymap, for example a script that runs `xkbcomp` in the Linux system. `MEOWTTY_XKM_DIR`: an absolute folder for its output.
 - The socket path has no leading slash (`tmp/.X11-unix/X2`): start the server in the root folder of the Linux system.
 
+- GLX with direct rendering only (`vfb-glx.c`): the clients render with their own Mesa, through DRI3. The server has no GL, so indirect contexts fail. Measured: glxgears 549 fps in a window, 159 at full screen (2400x1080).
+- MIT-SHM with fds only: the server makes its segments with `memfd_create`, and a SysV attach fails with BadAccess (Android kills an app for `shmat`). Clients under proot have no SysV shared memory, and Qt tests SysV first: most clients do not use MIT-SHM yet.
+- The window pixmaps of the composite extension are dma-bufs from `/dev/dma_heap/system` (`vfb-dri3.c`), so a compositor can take them as fds (FdsFromPixmap). The block handler flushes their CPU cache after a drawing. The Adreno Mesa does not import them yet: its kgsl path reports no dma-buf import.
+
 - `MEOWTTY_XBUF`: the abstract unix socket of the app. The server takes an AHardwareBuffer there (`vfb-android.c`) and uses its memory as the screen; the app shows the same buffer with no copy. `xbuf-jni.c` is the JNI library of the app that sends the buffer (`libmeowtty-xbuf-android-arm64.so`).
 
 The NDK compiler runs on x86_64 only. On an arm64 host, the script builds with the system clang and the sysroot and runtime of the NDK. The workflow builds it with the NDK of the runner.
