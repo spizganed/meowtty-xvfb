@@ -103,6 +103,9 @@ patch("Xext/shm.c",
       "        return BadAccess;\n"
       "#endif\n"
       "        shmdesc->addr = shmat(stuff->shmid, 0,")
+# The meson check finds no sigaction in the static bionic, but bionic has it. MIT-SHM with fds needs it (busfault.c).
+patch("include/meson.build", "conf_data.set('HAVE_SIGACTION', cc.has_function('sigaction') ? '1' : false)",
+      "conf_data.set('HAVE_SIGACTION', '1')")
 # dix-config.h undefines HAVE_MEMFD_CREATE (bionic before API 30 has no wrapper), and Android has no /tmp: call the
 # kernel directly.
 patch("Xext/shm.c",
